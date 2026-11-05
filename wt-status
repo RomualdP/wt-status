@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""
+wt-status / wt — see every git worktree on your machine, and clean them up safely.
+
+Finds the worktrees created by Claude Code, Codex, Cursor, Orca or by hand, tells you
+which ones still hold work and which ones can go, and lets you remove them.
+
+  wt                       interactive TUI: browse, tick, delete      (= wt-status -i)
+  wt-status                plain report, grouped by state
+  wt-status --size         ... with the disk size of each worktree (slower)
+  wt-status --repo api     only repos whose name contains "api"
+  wt-status --clean        remove every *removable* worktree, after confirmation
+  wt-status --clean --yes  ... without confirmation
+
+Safety: nothing is deleted without an explicit action. Normal removal is
+`git worktree remove` without --force, so git itself refuses if anything is
+uncommitted. Branches are never deleted. Forced removal (TUI, key `D`) first saves
+uncommitted changes with `git stash` and keeps unpushed commits on a branch.
+
+Scanned folders: arguments, else $WT_ROOTS (colon-separated), else common code folders.
+Language: English, or French when $WT_LANG / $LANG starts with "fr".
+Requires Python >= 3.8 and git >= 2.17. No third-party dependency.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+__version__ = "0.1.0"
+
+HOME = os.path.expanduser("~")
+DEFAULT_ROOTS = ["~/code", "~/dev", "~/src", "~/projects", "~/repos", "~/git", "~/work",
+                 "~/workspace", "~/Developer", "~/Documents", "~/orca/projects"]
+SKIP_DIRS = {"node_modules", ".claude", ".codex", ".cursor", ".git", "dist", "build", ".next",
+             "vendor", "Library", ".venv", "venv", "__pycache__", ".cache", "target", "Pods"}
+BASE_CANDIDATES = ["origin/HEAD", "origin/develop", "origin/main", "origin/master",
+                   "develop", "main", "master"]
+MAX_DEPTH = 5
+STALE_DAYS = 60
+
+# Worktree location patterns -> tool that created it
+ORIGINS = [("/.claude/worktrees/", "claude"), ("/.codex/worktrees/", "codex"),
+           ("/.cursor/worktrees/", "cursor"), ("/orca/workspaces/", "orca")]
+
+
+# ───────────────────────────── i18n ─────────────────────────────
+
+def _lang():
+    for var in ("WT_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(var, "")
+        if v:
+            return "fr" if v.lower().startswith("fr") else "en"
+    return "en"
+
+
+LANG = _lang()
+
+MSG = {
+    # states
+    "st.unknown":  ("UNKNOWN — git status failed", "INCONNU — git status a échoué"),
+    "st.dirty":    ("IN PROGRESS — uncommitted changes", "EN COURS — modifs non commitées"),
+    "st.unpushed": ("LOCAL COMMITS — never pushed", "COMMITS LOCAUX — jamais poussés"),
+    "st.open":     ("PUSHED — not merged yet", "POUSSÉ — pas encore mergé"),
+    "st.merged":   ("MERGED — removable", "MERGÉ — supprimable"),
+    "st.gone":     ("REMOTE BRANCH DELETED — removable", "BRANCHE DISTANTE SUPPRIMÉE — supprimable"),
+    "st.empty":    ("NO OWN COMMIT — removable", "AUCUN COMMIT PROPRE — supprimable"),
+    "st.missing":  ("ORPHAN — folder is gone, prune", "ORPHELIN — dossier disparu, prune"),
+    # units / words
+    "detached": ("(detached)", "(détaché)"),
+    "other": ("other", "autre"),
+    "today": ("today", "aujourd'hui"),
+    "days": ("{n} d", "{n} j"),
+    "months": ("{n} mo", "{n} mois"),
+    "gb": ("{v:.1f} GB", "{v:.1f} Go"),
+    "mb": ("{v:.0f} MB", "{v:.0f} Mo"),
+    "n_changes": ("{n} change(s)", "{n} modif(s)"),
+    "n_local": ("{n} local commit(s)", "{n} commit(s) locaux"),
+    # git errors
+    "err.dirty": ("uncommitted changes (commit, stash, or force with D)",
+                  "modifs non commitées (commit, stash, ou forcer avec D)"),
+    "err.locked": ("worktree is locked (git worktree unlock, or force with D)",
+                   "worktree verrouillé (git worktree unlock, ou forcer avec D)"),
+    "err.refused": ("refused by git", "refusé par git"),
+    "err.stash": ("could not stash changes: nothing removed", "stash des modifs impossible : rien supprimé"),
+    "err.backup": ("could not create backup branch: nothing removed",
+                   "branche de secours impossible : rien supprimé"),
+    "err.unknown": ("state unknown: open it and check by hand", "état inconnu : à vérifier à la main"),
+    "saved.stash": ("changes → git stash", "modifs → git stash"),
+    "saved.branch": ("commits → {b}", "commits → {b}"),
+    # CLI
+    "cli.none": ("No worktree found in: {roots}", "Aucun worktree trouvé dans : {roots}"),
+    "cli.summary": ("{n} worktrees in {r} repos", "{n} worktrees dans {r} repos"),
+    "cli.removable": ("{n} removable", "{n} supprimables"),
+    "cli.freeable": ("{a} freeable out of {b}", "{a} récupérables sur {b}"),
+    "cli.orphans": ("{n} empty Codex folders in ~/.codex/worktrees (harmless, removed by --clean)",
+                    "{n} dossiers Codex vides dans ~/.codex/worktrees (sans risque, supprimés par --clean)"),
+    "cli.hint": ("→ `wt` to pick what to delete, `wt-status --clean` to remove everything removable.",
+                 "→ `wt` pour choisir quoi supprimer, `wt-status --clean` pour tout ce qui est supprimable."),
+    "cli.nothing": ("Nothing to clean.", "Rien à nettoyer."),
+    "cli.confirm": ("Remove {n} worktrees{o}? [y/N] ", "Supprimer {n} worktrees{o} ? [o/N] "),
+    "cli.confirm_o": (" and {n} empty Codex folders", " et {n} dossiers Codex vides"),
+    "cli.cancel": ("Cancelled.", "Annulé."),
+    "cli.refused": ("  refused: {p} — {e}", "  refusé : {p} — {e}"),
+    "cli.done": ("{ok} worktrees removed{ko}. Branches are kept.",
+                 "{ok} worktrees supprimés{ko}. Les branches sont conservées."),
+    "cli.done_ko": (", {n} refused", ", {n} refusés"),
+    # TUI
+    "tui.scanning": ("Scanning worktrees…", "Scan des worktrees en cours…"),
+    "tui.title": (" Worktrees {n}{f}  ·  {r} removable ({rs})  ·  total {t}{s}",
+                  " Worktrees {n}{f}  ·  {r} supprimables ({rs})  ·  total {t}{s}"),
+    "tui.filtered": (" (filter “{f}”)", " (filtre « {f} »)"),
+    "tui.sizing": ("  ·  sizing…", "  ·  calcul des tailles…"),
+    "tui.header": ("REPO", "TOOL", "BRANCH", "ACTIVITY", "SIZE"),
+    "tui.header_fr": ("REPO", "OUTIL", "BRANCHE", "ACTIVITÉ", "TAILLE"),
+    "tui.last": ("last commit: {s}", "dernier commit : {s}"),
+    "tui.selected": ("{n} selected {s}  ", "{n} sélectionné(s) {s}  "),
+    "tui.footer": ("↑↓ move · space tick · a removable · / filter · d delete · ? help · q quit",
+                   "↑↓ naviguer · espace cocher · a supprimables · / filtre · d supprimer · ? aide · q quitter"),
+    "tui.filter": (" Filter (repo, branch or tool — empty = all): ",
+                   " Filtre (repo, branche ou outil — vide = tout) : "),
+    "tui.del_q": (" Remove {n} worktree(s) ({s})", " Supprimer {n} worktree(s) ({s})"),
+    "tui.del_risky": (" — {n} not removable: git will refuse those with changes (D to force)",
+                      " — dont {n} non supprimable(s) : git refusera ceux avec modifs (D pour forcer)"),
+    "tui.yn": (" ? [y/N] ", " ? [o/N] "),
+    "tui.force_q": (" FORCE-REMOVE {n} worktree(s)", " ABANDON FORCÉ de {n} worktree(s)"),
+    "tui.force_dirty": (" · {n} with changes (→ git stash)", " · {n} avec modifs (→ git stash)"),
+    "tui.force_local": (" · {n} with unpushed commits (branches kept)",
+                        " · {n} avec commits non poussés (branches conservées)"),
+    "tui.force_type": (" — type “yes”: ", " — tape « oui » : "),
+    "tui.cancel": (" Cancelled.", " Annulé."),
+    "tui.progress": (" Removing {i}/{n}: {r} / {b}", " Suppression {i}/{n} : {r} / {b}"),
+    "tui.done": (" ✓ {ok} removed{f}{st}{ko} · branches kept",
+                 " ✓ {ok} supprimé(s){f}{st}{ko} · branches conservées"),
+    "tui.freed": (", {s} freed", ", {s} libérés"),
+    "tui.stashed": (" · {n} saved in git stash", " · {n} sauvegarde(s) dans git stash"),
+    "tui.failed": (" · {n} refused — {e}", " · {n} refusé(s) — {e}"),
+    "tui.orph_q": (" Remove {n} empty Codex folder(s)? [y/N] ", " Supprimer {n} dossier(s) Codex vide(s) ? [o/N] "),
+    "tui.orph_none": (" No empty Codex folder.", " Aucun dossier Codex vide."),
+    "tui.orph_done": (" ✓ {n} empty Codex folder(s) removed", " ✓ {n} dossier(s) Codex vide(s) supprimé(s)"),
+    "tui.close": (" any key to close ", " une touche pour fermer "),
+    "tui.help_title": (" Help — wt ", " Aide — wt "),
+}
+
+HELP = {
+    "en": [
+        ("NAVIGATION", None),
+        ("↑ ↓   j k", "move"),
+        ("PgUp PgDn", "previous / next page"),
+        ("g  G", "top / bottom"),
+        ("", ""),
+        ("SELECTION", None),
+        ("space", "tick / untick the worktree"),
+        ("a", "tick every removable worktree"),
+        ("v", f"tick worktrees idle for more than {STALE_DAYS} days"),
+        ("n", "untick everything"),
+        ("/", "filter by repo, branch or tool (claude, codex, cursor, orca)"),
+        ("", ""),
+        ("ACTIONS", None),
+        ("d", "remove ticked worktrees (or the current one), never forced"),
+        ("D", "FORCE-remove, even with changes (saved in git stash first)"),
+        ("c", "remove empty Codex folders"),
+        ("o", "open the worktree in the file manager"),
+        ("r", "rescan"),
+        ("?  h", "show / hide this help"),
+        ("q  Esc", "quit"),
+        ("", ""),
+        ("STATES", None),
+        ("In progress", "uncommitted changes: `d` refuses, `D` stashes them"),
+        ("Local commits", "never pushed: push it, or force-remove (branch kept)"),
+        ("Pushed", "on the remote but not merged (open PR?)"),
+        ("Removable", "clean AND merged / remote branch deleted / no own commit"),
+        ("Orphan", "folder already gone: only git metadata is cleaned"),
+        ("", ""),
+        ("", "Branches are never deleted. Stashed work: `git stash list` in the repo."),
+    ],
+    "fr": [
+        ("NAVIGATION", None),
+        ("↑ ↓   j k", "monter / descendre"),
+        ("PgUp PgDn", "page précédente / suivante"),
+        ("g  G", "début / fin de liste"),
+        ("", ""),
+        ("SÉLECTION", None),
+        ("espace", "cocher / décocher le worktree"),
+        ("a", "cocher tous les supprimables"),
+        ("v", f"cocher les worktrees inactifs depuis plus de {STALE_DAYS} jours"),
+        ("n", "tout décocher"),
+        ("/", "filtrer par repo, branche ou outil (claude, codex, cursor, orca)"),
+        ("", ""),
+        ("ACTIONS", None),
+        ("d", "supprimer la sélection (ou la ligne courante), jamais forcé"),
+        ("D", "ABANDON FORCÉ, même avec modifs (sauvées en git stash avant)"),
+        ("c", "supprimer les dossiers Codex vides"),
+        ("o", "ouvrir le worktree dans le gestionnaire de fichiers"),
+        ("r", "relancer le scan"),
+        ("?  h", "afficher / masquer cette aide"),
+        ("q  Échap", "quitter"),
+        ("", ""),
+        ("ÉTATS", None),
+        ("En cours", "modifs non commitées : `d` refuse, `D` les stashe"),
+        ("Commits locaux", "jamais poussés : à pousser, ou abandon forcé (branche gardée)"),
+        ("Poussé", "sur le remote mais pas mergé (PR ouverte ?)"),
+        ("Supprimable", "propre ET mergé / branche distante supprimée / sans commit"),
+        ("Orphelin", "dossier déjà disparu : seul git est nettoyé"),
+        ("", ""),
+        ("", "Les branches ne sont jamais supprimées. Stash : `git stash list` dans le repo."),
+    ],
+}
+
+
+def t(key, **kw):
+    en, fr = MSG[key][:2]
+    s = fr if LANG == "fr" else en
+    return s.format(**kw) if kw else s
+
+
+# state -> (sort order, ANSI colour, removable)
+STATES = {
+    "unknown":  (0, "31", False),
+    "dirty":    (1, "33", False),
+    "unpushed": (2, "35", False),
+    "open":     (3, "36", False),
+    "merged":   (4, "32", True),
+    "gone":     (5, "32", True),
+    "empty":    (6, "32", True),
+    "missing":  (7, "90", True),
+}
+
+
+def label(state):
+    return t("st." + state)
+
+
+def removable(r):
+    return STATES[r["state"]][2]
+
+
+# ───────────────────────────── git helpers ─────────────────────────────
+
+def git(cwd, *args, timeout=60):
+    """Run git in `cwd`. Returns (returncode, stdout, stderr); never raises.
+    A leading "--no-optional-locks" is passed as a global git option."""
+    pre = []
+    if args and args[0] == "--no-optional-locks":
+        pre, args = ["--no-optional-locks"], args[1:]
+    try:
+        p = subprocess.run(["git", *pre, "-C", cwd, *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as e:  # timeout, git missing, unreadable folder…
+        return 1, "", str(e)
+
+
+def is_bare_repo(path):
+    return (os.path.isfile(os.path.join(path, "HEAD"))
+            and os.path.isdir(os.path.join(path, "objects"))
+            and os.path.isdir(os.path.join(path, "refs"))
+            and os.path.isfile(os.path.join(path, "config")))
+
+
+def find_main_repos(roots):
+    """Main repositories (normal or bare) under the given roots. Linked worktrees are
+    reached through their main repo, wherever they live on disk."""
+    repos = set()
+    for root in roots:
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dot_git = os.path.join(dirpath, ".git")
+            if os.path.isdir(dot_git):
+                repos.add(dirpath)
+                dirnames[:] = []
+                continue
+            if ".git" in filenames:          # linked worktree or submodule: not a main repo
+                dirnames[:] = []
+                continue
+            if is_bare_repo(dirpath):
+                repos.add(dirpath)
+                dirnames[:] = []
+                continue
+            if dirpath[len(root):].count(os.sep) >= MAX_DEPTH:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.endswith("-worktrees")]
+    return sorted(repos)
+
+
+def repo_name(repo):
+    base = os.path.basename(repo.rstrip(os.sep))
+    if base in (".bare", ".git"):
+        base = os.path.basename(os.path.dirname(repo.rstrip(os.sep)))
+    return base[:-4] if base.endswith(".git") else base
+
+
+def origin_of(path):
+    for needle, name in ORIGINS:
+        if needle in path:
+            return name
+    return t("other")
+
+
+def list_worktrees(repo):
+    """`git worktree list --porcelain`, minus the main worktree / bare entry."""
+    code, out, _ = git(repo, "worktree", "list", "--porcelain")
+    if code:
+        return []
+    items, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur:
+                items.append(cur)
+            cur = {}
+            continue
+        key, _, val = line.partition(" ")
+        cur[key] = val or True
+    return items[1:]
+
+
+def repo_context(repo):
+    bases = [b for b in BASE_CANDIDATES if git(repo, "rev-parse", "--verify", "-q", b)[0] == 0]
+    tracking = {}
+    _, out, _ = git(repo, "for-each-ref", "--format=%(refname:short)|%(upstream)|%(upstream:track)",
+                    "refs/heads")
+    for line in out.splitlines():
+        name, up, track = (line.split("|") + ["", ""])[:3]
+        tracking[name] = (up, track)
+    return bases, tracking
+
+
+def dir_size_kb(path):
+    try:
+        p = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=900)
+        return int(p.stdout.split()[0])
+    except Exception:
+        return 0
+
+
+# ───────────────────────────── inspection ─────────────────────────────
+
+def inspect(repo, wt, bases, tracking, want_size=False):
+    path = wt.get("worktree", "")
+    raw_branch = wt.get("branch")
+    branch = raw_branch.replace("refs/heads/", "", 1) if isinstance(raw_branch, str) else None
+    info = {"repo": repo_name(repo), "repo_path": repo, "path": path, "branch": branch,
+            "origin": origin_of(path), "dirty": 0, "unpushed": 0, "age_days": None,
+            "size_kb": 0, "locked": bool(wt.get("locked"))}
+
+    if wt.get("prunable") or not os.path.isdir(path):
+        info["state"] = "missing"
+        return info
+
+    # Last activity = most recent of last commit and index update. Read before running
+    # `git status`, and run it with --no-optional-locks so that it never rewrites the index.
+    _, ct, _ = git(path, "log", "-1", "--format=%ct")
+    last = int(ct) if ct.isdigit() else 0
+    _, gitdir, _ = git(path, "rev-parse", "--absolute-git-dir")
+    try:
+        last = max(last, int(os.path.getmtime(os.path.join(gitdir, "index"))))
+    except OSError:
+        pass
+    info["age_days"] = (time.time() - last) / 86400 if last else None
+
+    code, st, _ = git(path, "--no-optional-locks", "status", "--porcelain", timeout=120)
+    if code != 0:
+        # Never call a worktree clean when we could not check it.
+        info["state"] = "unknown"
+        return info
+    info["dirty"] = sum(1 for line in st.splitlines() if line.strip())
+
+    _, n, _ = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
+    info["unpushed"] = int(n) if n.isdigit() else 0
+    merged = any(git(path, "merge-base", "--is-ancestor", "HEAD", b)[0] == 0 for b in bases)
+    up, track = tracking.get(branch, ("", "")) if branch else ("", "")
+
+    if info["dirty"]:
+        info["state"] = "dirty"
+    elif up and "gone" in track:
+        info["state"] = "gone"           # typical after a squash-merged PR
+    elif merged:
+        info["state"] = "merged" if up else "empty"
+    elif info["unpushed"]:
+        info["state"] = "unpushed"
+    else:
+        info["state"] = "open"
+
+    if want_size:
+        info["size_kb"] = dir_size_kb(path)
+    return info
+
+
+def scan(roots, repo_filter=None, want_size=False):
+    repos = find_main_repos(roots)
+    if repo_filter:
+        repos = [r for r in repos if repo_filter.lower() in repo_name(r).lower()]
+    jobs = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for repo in repos:
+            wts = list_worktrees(repo)
+            if not wts:
+                continue
+            bases, tracking = repo_context(repo)
+            jobs += [ex.submit(inspect, repo, wt, bases, tracking, want_size) for wt in wts]
+        rows = [j.result() for j in jobs]
+    rows.sort(key=lambda r: (STATES[r["state"]][0], r["repo"], r["age_days"] or 0))
+    return rows
+
+
+def orphan_codex_dirs():
+    """~/.codex/worktrees/<id>/ folders that contain nothing but Codex's marker file."""
+    root = os.path.join(HOME, ".codex", "worktrees")
+    out = []
+    if os.path.isdir(root):
+        for d in sorted(os.listdir(root)):
+            full = os.path.join(root, d)
+            try:
+                if os.path.isdir(full) and not [x for x in os.listdir(full) if x != ".codex-worktree-name"]:
+                    out.append(full)
+            except OSError:
+                pass
+    return out
+
+
+def remove_empty_codex_dir(d):
+    try:
+        marker = os.path.join(d, ".codex-worktree-name")
+        if os.path.isfile(marker):
+            os.remove(marker)
+        os.rmdir(d)  # only succeeds if the folder is really empty
+        return True
+    except OSError:
+        return False
+
+
+# ───────────────────────────── removal ─────────────────────────────
+
+def _backup_branch_name(r):
+    base = "wt-backup/" + os.path.basename(r["path"].rstrip(os.sep))
+    name, i = base, 2
+    while git(r["repo_path"], "rev-parse", "--verify", "-q", "refs/heads/" + name)[0] == 0:
+        name, i = f"{base}-{i}", i + 1
+    return name
+
+
+def remove_worktree(r, force=False):
+    """Remove one worktree. Returns (ok, message).
+
+    force=False: plain `git worktree remove`; git refuses if anything is uncommitted.
+    force=True : stash uncommitted changes (incl. untracked files), keep detached
+                 unpushed commits on a wt-backup/* branch, then remove even if locked.
+                 Aborts, removing nothing, if any safety step fails."""
+    if r["state"] == "missing":
+        git(r["repo_path"], "worktree", "prune")
+        return True, ""
+    if r["state"] == "unknown" and not force:
+        return False, t("err.unknown")
+
+    saved = []
+    if force:
+        if r["dirty"] or r["state"] == "unknown":
+            label_ = f"wt-abandon {r['repo']}/{r['branch'] or 'detached'} {time.strftime('%Y-%m-%d')}"
+            before = git(r["path"], "rev-parse", "-q", "--verify", "refs/stash")[1]
+            code, _, _ = git(r["path"], "stash", "push", "--include-untracked", "-m", label_, timeout=600)
+            after = git(r["path"], "rev-parse", "-q", "--verify", "refs/stash")[1]
+            if code != 0:
+                return False, t("err.stash")
+            if after and after != before:
+                saved.append(t("saved.stash"))
+        if r["branch"] is None and r["unpushed"]:
+            name = _backup_branch_name(r)
+            if git(r["path"], "branch", name, "HEAD")[0] != 0:
+                return False, t("err.backup")
+            saved.append(t("saved.branch", b=name))
+
+    cmd = ["worktree", "remove"] + (["--force", "--force"] if force else []) + [r["path"]]
+    code, out, err = git(r["repo_path"], *cmd, timeout=900)
+    if code != 0:
+        msg = err or out
+        if "modified or untracked" in msg or "contains" in msg:
+            return False, t("err.dirty")
+        if "locked" in msg:
+            return False, t("err.locked")
+        return False, (msg.splitlines() or [t("err.refused")])[-1]
+    if r["origin"] == "codex":
+        remove_empty_codex_dir(os.path.dirname(r["path"].rstrip(os.sep)))
+    return True, ", ".join(saved)
+
+
+def remove_many(rows, force=False, progress=None):
+    """Returns (removed_rows, errors, n_stashed)."""
+    done, errors, stashed = [], [], 0
+    for i, r in enumerate(rows, 1):
+        if progress:
+            progress(i, len(rows), r)
+        ok, msg = remove_worktree(r, force=force)
+        if ok:
+            done.append(r)
+            stashed += t("saved.stash") in msg
+        else:
+            errors.append((r, msg))
+    for repo in {r["repo_path"] for r in rows}:
+        git(repo, "worktree", "prune")
+    return done, errors, stashed
+
+
+# ───────────────────────────── formatting ─────────────────────────────
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+
+def fmt_age(d):
+    if d is None:
+        return "?"
+    if d < 1:
+        return t("today")
+    if d < STALE_DAYS:
+        return t("days", n=int(d))
+    return t("months", n=int(d / 30))
+
+
+def fmt_size(kb):
+    if not kb:
+        return ""
+    if kb < 1024:
+        return "<1 MB" if LANG == "en" else "<1 Mo"
+    return t("gb", v=kb / 1048576) if kb > 1048576 * 0.95 else t("mb", v=kb / 1024)
+
+
+def short(p, n):
+    if p == HOME or p.startswith(HOME + os.sep):
+        p = "~" + p[len(HOME):]
+    return p if len(p) <= n else "…" + p[-(n - 1):]
+
+
+def branch_label(r):
+    return r["branch"] or t("detached")
+
+
+def row_detail(r):
+    if r["dirty"]:
+        return t("n_changes", n=r["dirty"])
+    if r["unpushed"] and r["state"] == "unpushed":
+        return t("n_local", n=r["unpushed"])
+    return ""
+
+
+def open_in_file_manager(path):
+    cmd = "open" if sys.platform == "darwin" else ("explorer" if os.name == "nt" else "xdg-open")
+    try:
+        subprocess.Popen([cmd, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+# ───────────────────────────── plain CLI ─────────────────────────────
+
+def report(rows, with_size):
+    current = None
+    for r in rows:
+        if r["state"] != current:
+            current = r["state"]
+            n = sum(1 for x in rows if x["state"] == current)
+            print("\n" + c("1;" + STATES[current][1], f"■ {label(current)}  ({n})"))
+        detail = row_detail(r)
+        print(f"  {r['repo'][:24]:<24} {r['origin']:<7} {branch_label(r)[:38]:<38} "
+              f"{fmt_age(r['age_days']):>11}  {fmt_size(r['size_kb']):>7}  "
+              f"{c('90', short(r['path'], 60))}"
+              + (f"  {c(STATES[r['state']][1], '· ' + detail)}" if detail else ""))
+
+    rem = [r for r in rows if removable(r)]
+    by_origin = {}
+    for r in rows:
+        by_origin[r["origin"]] = by_origin.get(r["origin"], 0) + 1
+    print("\n" + c("1", t("cli.summary", n=len(rows), r=len({r["repo_path"] for r in rows})))
+          + "  ·  " + ", ".join(f"{k} {v}" for k, v in sorted(by_origin.items(), key=lambda x: -x[1])))
+    line = t("cli.removable", n=len(rem))
+    if with_size:
+        line += "  ·  " + t("cli.freeable", a=fmt_size(sum(r["size_kb"] for r in rem)) or "0",
+                            b=fmt_size(sum(r["size_kb"] for r in rows)) or "0")
+    print(c("32", line))
+    return rem
+
+
+def run_cli(args, roots):
+    rows = scan(roots, args.repo, args.size)
+    orphans = orphan_codex_dirs()
+    if not rows and not orphans:
+        print(t("cli.none", roots=", ".join(roots)))
+        return 0
+    rem = report(rows, args.size) if rows else []
+    if orphans:
+        print(c("90", t("cli.orphans", n=len(orphans))))
+    if not args.clean:
+        if rem:
+            print(c("90", t("cli.hint")))
+        return 0
+    if not rem and not orphans:
+        print(t("cli.nothing"))
+        return 0
+    if not args.yes:
+        extra = t("cli.confirm_o", n=len(orphans)) if orphans else ""
+        try:
+            ans = input("\n" + t("cli.confirm", n=len(rem), o=extra))
+        except EOFError:
+            ans = ""
+        if ans.strip().lower() not in ("y", "yes", "o", "oui"):
+            print(t("cli.cancel"))
+            return 1
+    done, errors, _ = remove_many(rem)
+    for r, e in errors:
+        print(c("33", t("cli.refused", p=short(r["path"], 70), e=e)))
+    for d in orphans:
+        remove_empty_codex_dir(d)
+    ko = t("cli.done_ko", n=len(errors)) if errors else ""
+    print(c("32", t("cli.done", ok=len(done), ko=ko)))
+    return 0 if not errors else 2
+
+
+# ───────────────────────────── TUI ─────────────────────────────
+
+class TUI:
+    def __init__(self, roots, repo_filter=None):
+        self.roots = roots
+        self.rows, self.sel, self.orphans = [], set(), []
+        self.cur = self.top = 0
+        self.filter = repo_filter or ""
+        self.msg = ""
+        self.sizing = False
+        self.subjects = {}
+
+    # data ------------------------------------------------------------
+    def load(self, scr):
+        import threading
+        h, w = scr.getmaxyx()
+        scr.erase()
+        text = t("tui.scanning")
+        scr.addnstr(h // 2, max(0, (w - len(text)) // 2), text, w - 1)
+        scr.refresh()
+        self.rows, self.sel, self.subjects = scan(self.roots), set(), {}
+        self.orphans = orphan_codex_dirs()
+        self.cur = self.top = 0
+        threading.Thread(target=self._size_all, args=(list(self.rows),), daemon=True).start()
+
+    def _size_all(self, rows):
+        self.sizing = True
+
+        def one(r):
+            r["size_kb"] = dir_size_kb(r["path"])
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(one, [r for r in rows if r["state"] != "missing"]))
+        self.sizing = False
+
+    def visible(self):
+        f = self.filter.lower()
+        return [r for r in self.rows if not f or f in r["repo"].lower()
+                or f in (r["branch"] or "").lower() or f in r["origin"]]
+
+    def subject(self, r):
+        if r["path"] not in self.subjects:
+            self.subjects[r["path"]] = ("" if r["state"] == "missing"
+                                        else git(r["path"], "log", "-1", "--format=%s")[1])
+        return self.subjects[r["path"]]
+
+    def targets(self, current):
+        rows = [r for r in self.rows if r["path"] in self.sel]
+        return rows or ([current] if current else [])
+
+    # widgets -----------------------------------------------------------
+    def prompt(self, scr, text):
+        import curses
+        h, w = scr.getmaxyx()
+        scr.move(h - 1, 0)
+        scr.clrtoeol()
+        scr.addnstr(h - 1, 0, text, w - 1, curses.A_BOLD)
+        curses.echo()
+        curses.curs_set(1)
+        scr.timeout(-1)
+        try:
+            val = scr.getstr(h - 1, min(len(text), w - 2), 60).decode("utf-8", "ignore")
+        except Exception:
+            val = ""
+        curses.noecho()
+        curses.curs_set(0)
+        scr.timeout(500)
+        scr.clear()
+        return val.strip()
+
+    def confirm(self, scr, text, strong=False):
+        ans = self.prompt(scr, text).lower()
+        return ans in (("yes", "oui") if strong else ("y", "yes", "o", "oui"))
+
+    def help(self, scr):
+        import curses
+        lines = HELP[LANG]
+        off = 0
+        while True:
+            h, w = scr.getmaxyx()
+            bw = min(w - 2, 92)
+            fit = max(1, min(len(lines), h - 6))
+            bh = fit + 4
+            off = max(0, min(off, len(lines) - fit))
+            win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+            win.erase()
+            win.box()
+            win.addnstr(0, 2, t("tui.help_title"), bw - 4, curses.A_BOLD)
+            for i, (key, desc) in enumerate(lines[off:off + fit]):
+                y = i + 2
+                if desc is None:
+                    win.addnstr(y, 3, key, bw - 6, curses.A_BOLD | curses.A_UNDERLINE)
+                elif key:
+                    win.addnstr(y, 3, f"{key:<16}", bw - 6, curses.A_BOLD)
+                    win.addnstr(y, 20, desc, max(1, bw - 23))
+                elif desc:
+                    win.addnstr(y, 3, desc, bw - 6, curses.A_DIM)
+            close = t("tui.close") + ("↑↓ " if fit < len(lines) else "")
+            win.addnstr(bh - 1, max(2, bw - len(close) - 3), close, len(close), curses.A_DIM)
+            win.refresh()
+            scr.timeout(-1)
+            k = scr.getch()
+            if fit < len(lines) and k in (curses.KEY_DOWN, ord("j"), curses.KEY_NPAGE):
+                off += 1 if k != curses.KEY_NPAGE else fit
+            elif fit < len(lines) and k in (curses.KEY_UP, ord("k"), curses.KEY_PPAGE):
+                off -= 1 if k != curses.KEY_PPAGE else fit
+            elif k == curses.KEY_RESIZE:
+                pass
+            else:
+                break
+        scr.timeout(500)
+        scr.clear()
+
+    # actions -----------------------------------------------------------
+    def delete(self, scr, current, force):
+        targets = self.targets(current)
+        if not targets:
+            return
+        size = fmt_size(sum(r["size_kb"] for r in targets)) or "?"
+        if force:
+            nd = sum(1 for r in targets if r["dirty"] or r["state"] == "unknown")
+            nu = sum(1 for r in targets if r["state"] == "unpushed")
+            q = (t("tui.force_q", n=len(targets))
+                 + (t("tui.force_dirty", n=nd) if nd else "")
+                 + (t("tui.force_local", n=nu) if nu else "") + t("tui.force_type"))
+            ok = self.confirm(scr, q, strong=True)
+        else:
+            risky = sum(1 for r in targets if not removable(r))
+            q = t("tui.del_q", n=len(targets), s=size) + (t("tui.del_risky", n=risky) if risky else "")
+            ok = self.confirm(scr, q + t("tui.yn"))
+        if not ok:
+            self.msg = t("tui.cancel")
+            return
+
+        h, w = scr.getmaxyx()
+
+        def progress(i, n, r):
+            scr.move(h - 1, 0)
+            scr.clrtoeol()
+            scr.addnstr(h - 1, 0, t("tui.progress", i=i, n=n, r=r["repo"], b=branch_label(r)), w - 1)
+            scr.refresh()
+
+        done, errors, stashed = remove_many(targets, force=force, progress=progress)
+        for r in done:
+            self.rows.remove(r)
+        self.sel = set()
+        freed = fmt_size(sum(r["size_kb"] for r in done))
+        self.msg = t("tui.done", ok=len(done),
+                     f=t("tui.freed", s=freed) if freed else "",
+                     st=t("tui.stashed", n=stashed) if stashed else "",
+                     ko=t("tui.failed", n=len(errors),
+                          e=f"{branch_label(errors[0][0])}: {errors[0][1]}"[:90]) if errors else "")
+
+    def clean_orphans(self, scr):
+        if not self.orphans:
+            self.msg = t("tui.orph_none")
+            return
+        if not self.confirm(scr, t("tui.orph_q", n=len(self.orphans))):
+            self.msg = t("tui.cancel")
+            return
+        n = sum(remove_empty_codex_dir(d) for d in self.orphans)
+        self.orphans = orphan_codex_dirs()
+        self.msg = t("tui.orph_done", n=n)
+
+    # main loop ---------------------------------------------------------
+    def run(self, scr):
+        import curses
+        curses.curs_set(0)
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        colors = {"31": curses.COLOR_RED, "33": curses.COLOR_YELLOW, "35": curses.COLOR_MAGENTA,
+                  "36": curses.COLOR_CYAN, "32": curses.COLOR_GREEN, "90": curses.COLOR_WHITE}
+        pair = {}
+        for i, (code, col) in enumerate(colors.items(), start=1):
+            curses.init_pair(i, col, bg)
+            pair[code] = curses.color_pair(i)
+        curses.init_pair(20, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        HL, DIM = curses.color_pair(20), curses.A_DIM
+        head = MSG["tui.header_fr"] if LANG == "fr" else MSG["tui.header"]
+
+        self.load(scr)
+        scr.timeout(500)
+        while True:
+            rows = self.visible()
+            lines, state = [], None
+            for r in rows:
+                if r["state"] != state:
+                    state = r["state"]
+                    lines.append(("h", state))
+                lines.append(("r", r))
+            idx = [i for i, l in enumerate(lines) if l[0] == "r"]
+            self.cur = max(0, min(self.cur, len(idx) - 1)) if idx else 0
+            h, w = scr.getmaxyx()
+            list_h = max(3, h - 6)
+            cur_line = idx[self.cur] if idx else -1
+            current = lines[cur_line][1] if idx else None
+            if idx:
+                if cur_line < self.top:
+                    self.top = cur_line
+                if cur_line >= self.top + list_h:
+                    self.top = cur_line - list_h + 1
+                if self.top > 0 and lines[self.top - 1][0] == "h" and cur_line - self.top + 1 < list_h:
+                    self.top -= 1   # keep the group header visible
+
+            scr.erase()
+            rem = [r for r in rows if removable(r)]
+            title = t("tui.title", n=len(rows),
+                      f=t("tui.filtered", f=self.filter) if self.filter else "",
+                      r=len(rem), rs=fmt_size(sum(r["size_kb"] for r in rem)) or "…",
+                      t=fmt_size(sum(r["size_kb"] for r in rows)) or "…",
+                      s=t("tui.sizing") if self.sizing else "")
+            scr.addnstr(0, 0, title.ljust(w - 1), w - 1, curses.A_REVERSE | curses.A_BOLD)
+            scr.addnstr(1, 0, f"     {head[0]:<22} {head[1]:<7} {head[2]:<36} {head[3]:>11} {head[4]:>8}",
+                        w - 1, DIM)
+
+            for y, (kind, val) in enumerate(lines[self.top:self.top + list_h]):
+                li = self.top + y
+                if kind == "h":
+                    n = sum(1 for r in rows if r["state"] == val)
+                    scr.addnstr(2 + y, 0, f" ■ {label(val)} ({n})", w - 1,
+                                pair[STATES[val][1]] | curses.A_BOLD)
+                    continue
+                r = val
+                mark = "[x]" if r["path"] in self.sel else "[ ]"
+                detail = row_detail(r)
+                text = (f" {mark} {r['repo'][:22]:<22} {r['origin']:<7} {branch_label(r)[:36]:<36} "
+                        f"{fmt_age(r['age_days']):>11} {fmt_size(r['size_kb']) or '…':>8}"
+                        + (f"  {detail}" if detail else ""))
+                if li == cur_line:
+                    scr.addnstr(2 + y, 0, text.ljust(w - 1), w - 1, HL)
+                else:
+                    scr.addnstr(2 + y, 0, text, w - 1, pair[STATES[r["state"]][1]])
+
+            y0 = h - 4
+            scr.addnstr(y0, 0, "─" * (w - 1), w - 1, DIM)
+            if current:
+                scr.addnstr(y0 + 1, 0, " " + short(current["path"], w - 4), w - 1, curses.A_BOLD)
+                scr.addnstr(y0 + 2, 0, f" {label(current['state'])}  ·  "
+                            + t("tui.last", s=self.subject(current)), w - 1, DIM)
+            sel_rows = [r for r in self.rows if r["path"] in self.sel]
+            sel = t("tui.selected", n=len(sel_rows), s=fmt_size(sum(r["size_kb"] for r in sel_rows))) \
+                if sel_rows else ""
+            scr.addnstr(h - 1, 0, self.msg or (" " + sel + t("tui.footer")), w - 1,
+                        curses.A_BOLD if self.msg else DIM)
+            scr.refresh()
+
+            k = scr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            self.msg = ""
+            if k in (ord("q"), 27):
+                return
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.cur += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                self.cur = max(0, self.cur - 1)
+            elif k == curses.KEY_NPAGE:
+                self.cur += list_h
+            elif k == curses.KEY_PPAGE:
+                self.cur = max(0, self.cur - list_h)
+            elif k in (curses.KEY_HOME, ord("g")):
+                self.cur = 0
+            elif k in (curses.KEY_END, ord("G")):
+                self.cur = len(idx) - 1
+            elif k == ord(" ") and current:
+                self.sel ^= {current["path"]}
+                self.cur += 1
+            elif k == ord("a"):
+                self.sel |= {r["path"] for r in rem}
+            elif k == ord("v"):
+                self.sel |= {r["path"] for r in rows if (r["age_days"] or 0) > STALE_DAYS}
+            elif k == ord("n"):
+                self.sel = set()
+            elif k == ord("/"):
+                self.filter = self.prompt(scr, t("tui.filter"))
+                self.cur = self.top = 0
+            elif k == ord("o") and current and os.path.isdir(current["path"]):
+                open_in_file_manager(current["path"])
+            elif k in (ord("?"), ord("h")):
+                self.help(scr)
+            elif k == ord("r"):
+                self.load(scr)
+            elif k == ord("c"):
+                self.clean_orphans(scr)
+            elif k == ord("d"):
+                self.delete(scr, current, force=False)
+            elif k == ord("D"):
+                self.delete(scr, current, force=True)
+
+
+def run_tui(roots, repo_filter):
+    import curses
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(TUI(roots, repo_filter).run)
+    return 0
+
+
+# ───────────────────────────── entry point ─────────────────────────────
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="See every git worktree on your machine (Claude Code, Codex, Cursor, Orca, "
+                    "manual) and clean them up safely.")
+    ap.add_argument("roots", nargs="*", help="folders to scan (default: $WT_ROOTS, else common code folders)")
+    ap.add_argument("-i", "--tui", action="store_true", help="interactive interface (default when run as `wt`)")
+    ap.add_argument("--size", action="store_true", help="compute the disk size of each worktree")
+    ap.add_argument("--repo", metavar="TEXT", help="only repos whose name contains TEXT")
+    ap.add_argument("--clean", action="store_true", help="remove every removable worktree (never forced)")
+    ap.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation with --clean")
+    ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+    args = ap.parse_args(argv)
+
+    env_roots = [p for p in os.environ.get("WT_ROOTS", "").split(os.pathsep) if p]
+    roots = args.roots or env_roots or DEFAULT_ROOTS
+
+    if args.tui or (os.path.basename(sys.argv[0]) == "wt" and not args.clean):
+        if not sys.stdout.isatty():
+            ap.error("the interactive interface needs a terminal; use `wt-status` for a plain report")
+        return run_tui(roots, args.repo)
+    return run_cli(args, roots)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
