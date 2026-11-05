@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -199,7 +200,7 @@ class TestCli(Base):
         d = self.add(".claude/worktrees/dirty", "dirty")
         write(os.path.join(d, "new"))
         env = dict(os.environ, HOME=self.home, WT_LANG="en", WT_ROOTS=self.code)
-        out = subprocess.run([SCRIPT, "--clean", "--yes"], env=env, capture_output=True, text=True)
+        out = subprocess.run([sys.executable, SCRIPT, "--clean", "--yes"], env=env, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertFalse(os.path.exists(p))
         self.assertTrue(os.path.isdir(d))
@@ -208,7 +209,7 @@ class TestCli(Base):
     def test_french(self):
         self.add(".claude/worktrees/empty", "empty")
         env = dict(os.environ, HOME=self.home, WT_LANG="fr", WT_ROOTS=self.code)
-        out = subprocess.run([SCRIPT], env=env, capture_output=True, text=True)
+        out = subprocess.run([sys.executable, SCRIPT], env=env, capture_output=True, text=True)
         self.assertIn("supprimable", out.stdout)
 
 
