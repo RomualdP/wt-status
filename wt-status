@@ -19,7 +19,7 @@ uncommitted changes with `git stash` and keeps unpushed commits on a branch.
 
 Scanned folders: arguments, else $WT_ROOTS (colon-separated), else common code folders.
 Language: English, or French when $WT_LANG / $LANG starts with "fr".
-Requires Python >= 3.8 and git >= 2.17. No third-party dependency.
+Requires Python >= 3.9 and git >= 2.17. No third-party dependency.
 """
 import argparse
 import os

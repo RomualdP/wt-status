@@ -12,8 +12,8 @@ DEST="${WT_INSTALL_DIR:-$HOME/.local/bin}"
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 command -v git >/dev/null 2>&1 || err "git is required"
-command -v python3 >/dev/null 2>&1 || err "python3 (>= 3.8) is required"
-python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || err "python3 >= 3.8 is required"
+command -v python3 >/dev/null 2>&1 || err "python3 (>= 3.9) is required"
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || err "python3 >= 3.9 is required"
 
 mkdir -p "$DEST"
 here="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"

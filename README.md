@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/RomualdP/wt-status/main/install.sh 
 This installs one Python file, `wt-status`, plus a `wt` alias, into `~/.local/bin`. To pick
 another folder, set `WT_INSTALL_DIR`. You can also clone the repo and run `./install.sh`.
 
-It needs **Python ≥ 3.8** and **git ≥ 2.17**, and nothing else (no pip packages).
+It needs **Python ≥ 3.9** and **git ≥ 2.17**, and nothing else (no pip packages).
 It runs on macOS and Linux. The plain report works on Windows too.
 
 ## Usage
